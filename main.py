@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import sqlite3
+import pymysql
 import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
