@@ -248,20 +248,22 @@ def seed_pricing_data():
         if cur.fetchone()['c'] == 0:
             logger.info("Seeding credit_packages...")
             packages = [
-                ('starter', 2500, 500, '2,500 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5"])),
+                ('starter', 2500, 500, '2,500 credits', json.dumps(["gemini-2.0-flash"])),
                 ('basic', 5000, 900, '5,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5"])),
-                ('plus', 10000, 1500, '10,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5"])),
-                ('pro', 15000, 2000, '15,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5"])),
-                ('business', 50000, 5000, '50,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5"])),
+                ('plus', 10000, 1500, '10,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5", "gemini-2.5-pro-preview-06-05"])),
+                ('pro', 15000, 2000, '15,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5", "gemini-2.5-pro-preview-06-05", "gpt-5.0", "claude-opus-4.6"])),
+                ('business', 50000, 5000, '50,000 credits', json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5", "gemini-2.5-pro-preview-06-05", "gpt-5.0", "claude-opus-4.6"])),
             ]
             cur.executemany("INSERT INTO credit_packages (name, credits, price_cents, label, allowed_models) VALUES (%s, %s, %s, %s, %s)", packages)
 
         cur.execute("SELECT COUNT(*) as c FROM subscription_plans")
         if cur.fetchone()['c'] == 0:
             logger.info("Seeding subscription_plans...")
-            all_models = json.dumps(["gemini-2.0-flash", "gemini-2.5-pro-preview-06-05", "gpt-5.0", "claude-opus-4.6", "claude-sonnet-4.5"])
+            all_models = json.dumps(["gemini-2.0-flash", "claude-sonnet-4.5", "gemini-2.5-pro-preview-06-05", "gpt-5.0", "claude-opus-4.6"])
             cur.execute("INSERT INTO subscription_plans (name, credits_per_month, price_cents, allowed_models) VALUES (%s, %s, %s, %s)",
-                        ('pro', 15000, 2999, all_models))
+                        ('pro', 35000, 2999, all_models))
+            cur.execute("INSERT INTO subscription_plans (name, credits_per_month, price_cents, allowed_models) VALUES (%s, %s, %s, %s)",
+                        ('enterprise', 125000, 9999, all_models))
 
         cur.execute("SELECT COUNT(*) as c FROM token_credit_rates")
         if cur.fetchone()['c'] == 0:
@@ -496,10 +498,15 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="RoboServe Payments & Credits", version=VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["https://www.roboserve.eu", "https://roboserve.eu", "https://roboserve-vite-production.up.railway.app", "http://localhost", "http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["https://www.roboserve.eu", "https://roboserve.eu", "http://localhost:5173", "http://localhost", "http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
-def health(): return {"status": "ok", "service": SERVICE_NAME, "version": VERSION}
+def health_check():
+    return {"status": "ok"}
+
+@app.get("/")
+def root_check():
+    return {"status": "ok", "service": "svc-payments-temp"}
 
 # -- User Registration & Auth --------------------------------------------------
 @app.post("/api/v1/register", response_model=Token)
@@ -792,12 +799,16 @@ async def subscribe(request: Request):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if plan_id != "subscription pro":
-        # Fallback to pro if exact string doesn't match for some reason, or reject
-        pass
+    if plan_id in ["enterprise", "subscription enterprise"]:
+        amount_eur = 99.99
+        credits = 125000
+        plan_id_clean = "enterprise"
+    else:
+        # Fallback to pro
+        amount_eur = 29.99
+        credits = 35000
+        plan_id_clean = "pro"
 
-    amount_eur = 29.99
-    credits = 15000
     bunq_tx_id = f"bunq_sub_mock_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -805,14 +816,14 @@ async def subscribe(request: Request):
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO transactions (user_email, type, package_id, amount_eur, credits, bunq_transaction_id, status) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (user_email, "subscription", plan_id, amount_eur, credits, bunq_tx_id, "pending")
+                    (user_email, "subscription", plan_id_clean, amount_eur, credits, bunq_tx_id, "pending")
                 )
                 tx_id = cur.lastrowid
     except Exception as e:
         logger.error(f"Error creating transaction: {e}")
         raise HTTPException(status_code=500, detail="Database error")
 
-    mock_url = f"https://bunq.me/roboserve/{amount_eur}?description=Sub_{plan_id}_{tx_id}"
+    mock_url = f"https://bunq.me/roboserve/{amount_eur}?description=Sub_{plan_id_clean}_{tx_id}"
     
     return {"payment_url": mock_url, "subscription_id": str(tx_id), "bunq_transaction_id": bunq_tx_id}
 
@@ -890,3 +901,310 @@ async def user_balance(user_email: str = None, x_user_email: str = Header(None, 
         logger.error(f"Error fetching balance: {e}")
         raise HTTPException(status_code=500, detail="Database error")
 
+
+
+# -- New Subagent Endpoints (DEEL 1) -------------------------------------------
+
+class AuthLogin(BaseModel):
+    email: str
+    password: str
+
+class DeductCreditsRequest(BaseModel):
+    amount: int
+    reason: str = ""
+    model: str = ""
+
+class ContactRequest(BaseModel):
+    name: str
+    email: str
+    message: str
+
+@app.post("/api/auth/register")
+async def api_auth_register(user_data: UserCreate):
+    email = user_data.email.strip().lower()
+    if get_user_by_email(email):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_password = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    is_admin = (email == ADMIN_EMAIL)
+    legacy_token = secrets.token_urlsafe(32)
+
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (email, name, password_hash, is_admin, token, credits) VALUES (%s, %s, %s, %s, %s, %s)", (email, user_data.name, hashed_password, is_admin, legacy_token, FREE_CREDITS))
+                user_id = cur.lastrowid
+                cur.execute("INSERT INTO credit_transactions (user_id, amount, balance_after, tx_type, description) VALUES (%s, %s, %s, %s, %s)", (user_id, FREE_CREDITS, FREE_CREDITS, "signup_bonus", "Welcome credits"))
+        
+        access_token = create_access_token(data={"sub": email}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+        return {"token": access_token, "user": {"email": email, "name": user_data.name, "credits_balance": FREE_CREDITS, "subscription_plan": None}}
+    except Exception as e:
+        logger.error(f"Registration error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/auth/login")
+async def api_auth_login(req: AuthLogin):
+    user = get_user_by_email(req.email.strip().lower())
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    access_token = create_access_token(data={"sub": user["email"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {
+        "token": access_token,
+        "user": {
+            "email": user["email"],
+            "name": user["name"],
+            "credits_balance": user["credits"],
+            "subscription_plan": user.get("subscription_plan")
+        }
+    }
+
+@app.get("/api/auth/me")
+async def api_auth_me(current_user: dict = Depends(get_current_user)):
+    return {
+        "email": current_user["email"],
+        "name": current_user["name"],
+        "credits_balance": current_user["credits"],
+        "subscription_plan": current_user.get("subscription_plan"),
+        "is_subscriber": bool(current_user.get("is_subscriber"))
+    }
+
+@app.post("/api/deduct-credits")
+async def api_deduct_credits(req: DeductCreditsRequest, current_user: dict = Depends(get_current_user)):
+    if current_user["credits"] < req.amount:
+        raise HTTPException(status_code=403, detail="Insufficient credits")
+    
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET credits = credits - %s WHERE id = %s", (req.amount, current_user["id"]))
+                cur.execute("SELECT credits FROM users WHERE id = %s", (current_user["id"],))
+                new_balance = cur.fetchone()['credits']
+                cur.execute("INSERT INTO credit_transactions (user_id, amount, balance_after, tx_type, description, model) VALUES (%s, %s, %s, %s, %s, %s)", 
+                            (current_user["id"], -req.amount, new_balance, "deduction", req.reason, req.model))
+        return {"status": "success", "credits_remaining": new_balance}
+    except Exception as e:
+        logger.error(f"Deduct credits error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+import smtplib
+from email.message import EmailMessage
+
+@app.post("/api/contact")
+async def api_contact(req: ContactRequest):
+    logger.info(f"Contact form submitted by {req.name} ({req.email}): {req.message}")
+    
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = os.getenv("SMTP_PORT")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+    smtp_from = os.getenv("SMTP_FROM", "info@roboserve.eu")
+    
+    if not all([smtp_host, smtp_port, smtp_user, smtp_pass]):
+        logger.warning("SMTP environment variables missing. Logging successful contact submission only.")
+        return {"status": "success", "message": "Logged successfully (SMTP not configured)"}
+    
+    try:
+        msg = EmailMessage()
+        msg.set_content(f"Name: {req.name}\nEmail: {req.email}\nMessage:\n{req.message}")
+        msg['Subject'] = f"New Contact Form Submission from {req.name}"
+        msg['From'] = smtp_from
+        msg['To'] = ADMIN_EMAIL
+        msg['Reply-To'] = req.email
+        
+        with smtplib.SMTP(smtp_host, int(smtp_port)) as s:
+            s.starttls()
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+            
+        return {"status": "success", "message": "Email sent"}
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send email")
+
+
+
+# -- Roboserve Admin v2 Endpoints ----------------------------------------------
+async def verify_admin_password(x_admin_password: str = Header(None)):
+    expected_password = os.getenv("ADMIN_PASSWORD", "admin")
+    if not x_admin_password or x_admin_password != expected_password:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Password header")
+    return True
+
+@app.get("/api/admin/stats", dependencies=[Depends(verify_admin_password)])
+async def get_admin_stats():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) as total FROM users")
+                total_users = cur.fetchone()['total']
+                
+                cur.execute("SELECT SUM(amount_eur) as rev FROM transactions WHERE status='completed' AND MONTH(created_at) = MONTH(CURRENT_DATE()) AND YEAR(created_at) = YEAR(CURRENT_DATE())")
+                rev = cur.fetchone()['rev']
+                revenue_this_month = float(rev) if rev else 0.0
+                
+                cur.execute("SELECT SUM(ABS(amount)) as consumed FROM credit_transactions WHERE amount < 0 AND DATE(created_at) = CURRENT_DATE()")
+                consumed = cur.fetchone()['consumed']
+                credits_consumed_today = int(consumed) if consumed else 0
+                
+                cur.execute("SELECT COUNT(*) as active FROM users WHERE is_subscriber = 1")
+                active_subscriptions = cur.fetchone()['active']
+                
+                return {
+                    "total_users": total_users,
+                    "revenue_this_month": revenue_this_month,
+                    "credits_consumed_today": credits_consumed_today,
+                    "active_subscriptions": active_subscriptions
+                }
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/packages", dependencies=[Depends(verify_admin_password)])
+async def get_admin_packages():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM credit_packages")
+                return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/packages/{name}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_package(name: str, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE credit_packages SET credits=%s, price_cents=%s, allowed_models=%s WHERE name=%s",
+                            (data.get('credits'), data.get('price_cents'), json.dumps(data.get('allowed_models', [])), name))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/subscriptions", dependencies=[Depends(verify_admin_password)])
+async def get_admin_subscriptions():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM subscriptions")
+                return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/subscriptions/{name}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_subscription(name: str, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE subscription_plans SET credits_per_month=%s, price_cents=%s, allowed_models=%s WHERE name=%s",
+                            (data.get('credits_per_month'), data.get('price_cents'), json.dumps(data.get('allowed_models', [])), name))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/rates", dependencies=[Depends(verify_admin_password)])
+async def get_admin_rates():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM token_rates")
+                return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/rates/{model}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_rate(model: str, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE token_credit_rates SET credits_per_1k_tokens=%s, subscription_only=%s WHERE model=%s",
+                            (data.get('credits_per_1k_tokens'), data.get('subscription_only', False), model))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/users", dependencies=[Depends(verify_admin_password)])
+async def get_admin_users():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, email, name, credits, is_subscriber, subscription_plan, is_admin, created_at FROM users ORDER BY created_at DESC")
+                users = cur.fetchall()
+                for u in users:
+                    if u['created_at']:
+                        u['created_at'] = str(u['created_at'])
+                return users
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/users/{email}/credits", dependencies=[Depends(verify_admin_password)])
+async def update_admin_user_credits(email: str, request: Request):
+    data = await request.json()
+    amount_change = data.get('amount', 0)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, credits FROM users WHERE email=%s", (email,))
+                user = cur.fetchone()
+                if not user:
+                    raise HTTPException(status_code=404, detail="User not found")
+                
+                new_credits = user['credits'] + amount_change
+                if new_credits < 0: new_credits = 0
+                
+                cur.execute("UPDATE users SET credits=%s WHERE email=%s", (new_credits, email))
+                cur.execute("INSERT INTO credit_transactions (user_id, amount, balance_after, tx_type, description) VALUES (%s, %s, %s, %s, %s)",
+                            (user['id'], amount_change, new_credits, 'admin_adjustment', 'Admin panel adjustment'))
+        return {"status": "success", "new_credits": new_credits}
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/usage-logs", dependencies=[Depends(verify_admin_password)])
+async def get_admin_usage_logs():
+    import os, json
+    log_file = os.path.expanduser("~/clawd/logs/blog-api-usage.jsonl")
+    logs = []
+    try:
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                lines = f.readlines()
+                # Get last 100 lines and reverse
+                recent_lines = reversed(lines[-100:])
+                for line in recent_lines:
+                    if not line.strip(): continue
+                    try:
+                        logs.append(json.loads(line))
+                    except:
+                        pass
+        return logs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/services", dependencies=[Depends(verify_admin_password)])
+async def get_admin_services_v2():
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM services")
+                services = cur.fetchall()
+                # Return list to match the older API structure, or dictionary if frontend expects it
+                return {"services": services}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/services/{service_id}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_service_status_v2(service_id: str, request: Request):
+    data = await request.json()
+    new_status = data.get("status", "off")
+    with db() as db_conn:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO service_status (service_id, status) VALUES (%s, %s) ON DUPLICATE KEY UPDATE status = VALUES(status)",
+                (service_id, new_status)
+            )
+        db_conn.commit()
+    return {"status": "updated", "service_id": service_id, "new_status": new_status}
