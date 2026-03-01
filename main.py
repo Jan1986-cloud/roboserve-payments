@@ -721,10 +721,7 @@ async def update_service_status(service_id: str, request: Request, current_user:
     new_status = data.get("status", "off")
     with db() as db_conn:
         with db_conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO service_status (service_id, status) VALUES (%s, %s) ON DUPLICATE KEY UPDATE status = VALUES(status)",
-                (service_id, new_status)
-            )
+            cur.execute("UPDATE services SET status=%s WHERE id=%s OR name=%s", (new_status, service_id, service_id))
         db_conn.commit()
     return {"status": "updated", "service_id": service_id, "new_status": new_status}
 
@@ -1076,8 +1073,8 @@ async def update_admin_package(name: str, request: Request):
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE credit_packages SET credits=%s, price_cents=%s, allowed_models=%s WHERE name=%s",
-                            (data.get('credits'), data.get('price_cents'), json.dumps(data.get('allowed_models', [])), name))
+                cur.execute("UPDATE credit_packages SET credits=%s, price_eur=%s, is_active=%s WHERE name=%s",
+                            (data.get('credits'), data.get('price_eur'), data.get('is_active', True), name))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1098,8 +1095,8 @@ async def update_admin_subscription(name: str, request: Request):
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE subscription_plans SET credits_per_month=%s, price_cents=%s, allowed_models=%s WHERE name=%s",
-                            (data.get('credits_per_month'), data.get('price_cents'), json.dumps(data.get('allowed_models', [])), name))
+                cur.execute("UPDATE subscriptions SET credits_per_month=%s, price_eur=%s, is_active=%s WHERE name=%s",
+                            (data.get('credits_per_month'), data.get('price_eur'), data.get('is_active', True), name))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1120,8 +1117,8 @@ async def update_admin_rate(model: str, request: Request):
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE token_credit_rates SET credits_per_1k_tokens=%s, subscription_only=%s WHERE model=%s",
-                            (data.get('credits_per_1k_tokens'), data.get('subscription_only', False), model))
+                cur.execute("UPDATE token_rates SET credits_per_1k=%s, api_cost=%s, is_active=%s WHERE model_name=%s",
+                            (data.get('credits_per_1k'), data.get('api_cost'), data.get('is_active', True), model))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1202,9 +1199,6 @@ async def update_admin_service_status_v2(service_id: str, request: Request):
     new_status = data.get("status", "off")
     with db() as db_conn:
         with db_conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO service_status (service_id, status) VALUES (%s, %s) ON DUPLICATE KEY UPDATE status = VALUES(status)",
-                (service_id, new_status)
-            )
+            cur.execute("UPDATE services SET status=%s WHERE id=%s OR name=%s", (new_status, service_id, service_id))
         db_conn.commit()
     return {"status": "updated", "service_id": service_id, "new_status": new_status}
