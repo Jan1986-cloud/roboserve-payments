@@ -5,3 +5,4 @@ python-jose[cryptography]
 pydantic[email]
 python-multipart
 pymysql
+email-validator

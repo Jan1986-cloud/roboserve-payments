@@ -213,6 +213,21 @@ _INIT_SQL = [
         service_id VARCHAR(255) PRIMARY KEY,
         status VARCHAR(50) DEFAULT 'off',
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS automations (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        user_email VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        frequency VARCHAR(50) NOT NULL,
+        wp_url VARCHAR(255) NOT NULL,
+        wp_secret VARCHAR(255) NOT NULL,
+        target_audience TEXT,
+        tone VARCHAR(50),
+        forbidden_topics TEXT,
+        cta_text TEXT,
+        publish_mode VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )"""
 ]
 
@@ -498,7 +513,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="RoboServe Payments & Credits", version=VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["https://www.roboserve.eu", "https://roboserve.eu", "http://localhost:5173", "http://localhost", "http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["https://www.roboserve.eu", "https://roboserve.eu", "http://localhost:5173", "http://localhost", "http://localhost:3000", "https://roboserve-admin-production.up.railway.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/health")
 def health_check():
@@ -907,7 +922,7 @@ class AuthLogin(BaseModel):
     password: str
 
 class DeductCreditsRequest(BaseModel):
-    amount: int
+    amount: float
     reason: str = ""
     model: str = ""
 
@@ -968,17 +983,18 @@ async def api_auth_me(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/deduct-credits")
 async def api_deduct_credits(req: DeductCreditsRequest, current_user: dict = Depends(get_current_user)):
-    if current_user["credits"] < req.amount:
+    deduct_amount = int(math.ceil(req.amount))
+    if current_user["credits"] < deduct_amount:
         raise HTTPException(status_code=403, detail="Insufficient credits")
     
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE users SET credits = credits - %s WHERE id = %s", (req.amount, current_user["id"]))
+                cur.execute("UPDATE users SET credits = credits - %s WHERE id = %s", (deduct_amount, current_user["id"]))
                 cur.execute("SELECT credits FROM users WHERE id = %s", (current_user["id"],))
                 new_balance = cur.fetchone()['credits']
                 cur.execute("INSERT INTO credit_transactions (user_id, amount, balance_after, tx_type, description, model) VALUES (%s, %s, %s, %s, %s, %s)", 
-                            (current_user["id"], -req.amount, new_balance, "deduction", req.reason, req.model))
+                            (current_user["id"], -deduct_amount, new_balance, "deduction", req.reason, req.model))
         return {"status": "success", "credits_remaining": new_balance}
     except Exception as e:
         logger.error(f"Deduct credits error: {e}")
@@ -991,6 +1007,15 @@ from email.message import EmailMessage
 async def api_contact(req: ContactRequest):
     logger.info(f"Contact form submitted by {req.name} ({req.email}): {req.message}")
     
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO contact_messages (name, email, message) VALUES (%s, %s, %s)",
+                            (req.name, req.email, req.message))
+    except Exception as e:
+        logger.error(f"Failed to save contact message to db: {e}")
+        # Continue to send email even if DB insert fails
+        
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = os.getenv("SMTP_PORT")
     smtp_user = os.getenv("SMTP_USER")
@@ -1020,6 +1045,22 @@ async def api_contact(req: ContactRequest):
         raise HTTPException(status_code=500, detail="Failed to send email")
 
 
+
+@app.get("/api/user/usage")
+async def get_user_usage(current_user: dict = Depends(get_current_user)):
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, amount, balance_after, tx_type, description, service, model, tokens_used, created_at FROM credit_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 50", (current_user['id'],))
+                transactions = cur.fetchall()
+                # Convert datetime to string
+                for tx in transactions:
+                    if tx.get('created_at'):
+                        tx['created_at'] = str(tx['created_at'])
+                return {"transactions": transactions}
+    except Exception as e:
+        logger.error(f"Error fetching user usage: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 # -- Roboserve Admin v2 Endpoints ----------------------------------------------
 async def verify_admin_password(x_admin_password: str = Header(None)):
@@ -1067,14 +1108,36 @@ async def get_admin_packages():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/admin/packages/{name}", dependencies=[Depends(verify_admin_password)])
-async def update_admin_package(name: str, request: Request):
+@app.post("/api/admin/packages", dependencies=[Depends(verify_admin_password)])
+async def create_admin_package(request: Request):
     data = await request.json()
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE credit_packages SET credits=%s, price_eur=%s, is_active=%s WHERE name=%s",
-                            (data.get('credits'), data.get('price_eur'), data.get('is_active', True), name))
+                cur.execute("INSERT INTO credit_packages (name, price_eur, credits, is_active) VALUES (%s, %s, %s, %s)",
+                            (data.get('name'), data.get('price_eur'), data.get('credits'), data.get('is_active', True)))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/packages/{id}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_package(id: int, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE credit_packages SET name=%s, credits=%s, price_eur=%s, is_active=%s WHERE id=%s",
+                            (data.get('name'), data.get('credits'), data.get('price_eur'), data.get('is_active', True), id))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/packages/{id}", dependencies=[Depends(verify_admin_password)])
+async def delete_admin_package(id: int):
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM credit_packages WHERE id=%s", (id,))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1089,14 +1152,36 @@ async def get_admin_subscriptions():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/admin/subscriptions/{name}", dependencies=[Depends(verify_admin_password)])
-async def update_admin_subscription(name: str, request: Request):
+@app.post("/api/admin/subscriptions", dependencies=[Depends(verify_admin_password)])
+async def create_admin_subscription(request: Request):
     data = await request.json()
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE subscriptions SET credits_per_month=%s, price_eur=%s, is_active=%s WHERE name=%s",
-                            (data.get('credits_per_month'), data.get('price_eur'), data.get('is_active', True), name))
+                cur.execute("INSERT INTO subscriptions (name, price_eur, credits_per_month, is_active) VALUES (%s, %s, %s, %s)",
+                            (data.get('name'), data.get('price_eur'), data.get('credits_per_month'), data.get('is_active', True)))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/subscriptions/{id}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_subscription(id: int, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE subscriptions SET name=%s, credits_per_month=%s, price_eur=%s, is_active=%s WHERE id=%s",
+                            (data.get('name'), data.get('credits_per_month'), data.get('price_eur'), data.get('is_active', True), id))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/subscriptions/{id}", dependencies=[Depends(verify_admin_password)])
+async def delete_admin_subscription(id: int):
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM subscriptions WHERE id=%s", (id,))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1111,14 +1196,36 @@ async def get_admin_rates():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/api/admin/rates/{model}", dependencies=[Depends(verify_admin_password)])
-async def update_admin_rate(model: str, request: Request):
+@app.post("/api/admin/rates", dependencies=[Depends(verify_admin_password)])
+async def create_admin_rate(request: Request):
     data = await request.json()
     try:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE token_rates SET credits_per_1k=%s, api_cost=%s, is_active=%s WHERE model_name=%s",
-                            (data.get('credits_per_1k'), data.get('api_cost'), data.get('is_active', True), model))
+                cur.execute("INSERT INTO token_rates (model_name, credits_per_1k, api_cost, is_active) VALUES (%s, %s, %s, %s)",
+                            (data.get('model_name'), data.get('credits_per_1k'), data.get('api_cost'), data.get('is_active', True)))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/rates/{id}", dependencies=[Depends(verify_admin_password)])
+async def update_admin_rate(id: int, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE token_rates SET model_name=%s, credits_per_1k=%s, api_cost=%s, is_active=%s WHERE id=%s",
+                            (data.get('model_name'), data.get('credits_per_1k'), data.get('api_cost'), data.get('is_active', True), id))
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/rates/{id}", dependencies=[Depends(verify_admin_password)])
+async def delete_admin_rate(id: int):
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM token_rates WHERE id=%s", (id,))
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1134,6 +1241,18 @@ async def get_admin_users():
                     if u['created_at']:
                         u['created_at'] = str(u['created_at'])
                 return users
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/admin/users/{email}/plan", dependencies=[Depends(verify_admin_password)])
+async def update_admin_user_plan(email: str, request: Request):
+    data = await request.json()
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET subscription_plan=%s, is_subscriber=%s WHERE email=%s",
+                            (data.get('subscription_plan'), data.get('is_subscriber', False), email))
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1188,7 +1307,6 @@ async def get_admin_services_v2():
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM services")
                 services = cur.fetchall()
-                # Return list to match the older API structure, or dictionary if frontend expects it
                 return {"services": services}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1197,8 +1315,57 @@ async def get_admin_services_v2():
 async def update_admin_service_status_v2(service_id: str, request: Request):
     data = await request.json()
     new_status = data.get("status", "off")
-    with db() as db_conn:
-        with db_conn.cursor() as cur:
-            cur.execute("UPDATE services SET status=%s WHERE id=%s OR name=%s", (new_status, service_id, service_id))
-        db_conn.commit()
-    return {"status": "updated", "service_id": service_id, "new_status": new_status}
+    # Als service_id een integer is (id), probeer int. Als het een string is (naam), gebruik als string.
+    try:
+        with db() as db_conn:
+            with db_conn.cursor() as cur:
+                if service_id.isdigit():
+                    cur.execute("UPDATE services SET status=%s, name=%s, url=%s WHERE id=%s", (new_status, data.get('name'), data.get('url'), int(service_id)))
+                else:
+                    cur.execute("UPDATE services SET status=%s WHERE name=%s", (new_status, service_id))
+            db_conn.commit()
+        return {"status": "updated", "service_id": service_id, "new_status": new_status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -- Automations Endpoints -----------------------------------------------------
+class AutomationCreate(BaseModel):
+    name: str
+    frequency: str
+    wp_url: str
+    wp_secret: str
+    target_audience: str = ""
+    tone: str = "Professional"
+    forbidden_topics: str = ""
+    cta_text: str = ""
+    publish_mode: str = "draft"
+
+@app.post("/api/automations")
+async def create_automation(automation: AutomationCreate, current_user: dict = Depends(get_current_user)):
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO automations (user_email, name, frequency, wp_url, wp_secret, target_audience, tone, forbidden_topics, cta_text, publish_mode) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (current_user["email"], automation.name, automation.frequency, automation.wp_url, automation.wp_secret, automation.target_audience, automation.tone, automation.forbidden_topics, automation.cta_text, automation.publish_mode)
+                )
+        return {"status": "success", "message": "Automation created successfully"}
+    except Exception as e:
+        logger.error(f"Error creating automation: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+@app.get("/api/automations")
+async def get_automations(current_user: dict = Depends(get_current_user)):
+    try:
+        with db() as conn:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute("SELECT id, name, frequency, wp_url, target_audience, tone, publish_mode, created_at FROM automations WHERE user_email = %s ORDER BY created_at DESC", (current_user["email"],))
+                automations = cur.fetchall()
+                for a in automations:
+                    if a.get('created_at'):
+                        a['created_at'] = str(a['created_at'])
+                return {"automations": automations}
+    except Exception as e:
+        logger.error(f"Error fetching automations: {e}")
+        raise HTTPException(status_code=500, detail="Database error")

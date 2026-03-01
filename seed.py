@@ -70,6 +70,17 @@ try:
             )
         """)
 
+        # Create contact_messages table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS contact_messages (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         print("Tables created successfully (if they didn't exist).")
 
         # Insert/Replace Token Rates: Gemini Flash (15), Claude Sonnet (80), Gemini Pro (120), GPT-5 (120), Claude Opus (350).
